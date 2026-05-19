@@ -10,7 +10,6 @@ This tool integrates with any Jira instance (Cloud or Server) and supports authe
 - **Authentication** using Bearer token or Basic Auth.  
 - **List issues** by project, assignee, status, or JQL.  
 - **Log work** directly to issues from the CLI.  
-- **Create and update issues** without leaving your terminal.  
 - **Customizable output** (status, type, summary, updated time, etc.).  
 - **Config file support** for storing Jira instance URL and credentials.  
 - Works with **any Jira instance** (Server or Cloud).  
@@ -25,6 +24,7 @@ Clone the repository and make the script executable:
 git clone https://github.com/amirsaeedahmadi/jira-cli.git
 cd jira-cli
 chmod +x jira-cli.sh
+cp ./.jira-cli.conf ~/.jira-cli.conf
 ```
 
 (Optional) Add it to your `$PATH` for global usage:
@@ -32,6 +32,12 @@ chmod +x jira-cli.sh
 ```bash
 sudo ln -s $(pwd)/jira-cli.sh /usr/local/bin/jira
 ```
+
+(Optional) Add this alias in ~/.bashrc or ~/.zshrc for "j" instead of "jira"
+```bash
+alias j='jira'
+```
+ 
 
 Now you can run commands with:
 
@@ -108,16 +114,6 @@ jira jql "assignee = currentUser() AND status = 'In Progress'"
 
 ---
 
-## Demo
-
-Here’s how it looks in action:
-
-![Jira CLI Demo](docs/demo.gif)
-
-*(Replace `docs/demo.gif` with your actual screenshot or GIF path)*
-
----
-
 ## Development
 
 To contribute or extend:
@@ -128,11 +124,4 @@ cd jira-cli
 # hack on jira-cli.sh
 ```
 
----
-
-## License
-
-This project is licensed under the **MIT License** – see the [LICENSE](LICENSE) file for details.
-
----
 
