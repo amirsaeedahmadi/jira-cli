@@ -282,6 +282,303 @@ cmd_delete_comment() {
   [[ -z "$out" ]] && echo "Comment $comment_id deleted from $key." || echo "$out" | jq . 2>/dev/null || echo "$out"
 }
 
+jira_text_field_json() {
+  local text="$1"
+
+  if [[ "$JIRA_API_PREFIX" == *"/3" ]]; then
+    jq -cn --arg t "$text" '
+      {
+        type: "doc",
+        version: 1,
+        content: [
+          {
+            type: "paragraph",
+            content: [
+              { type: "text", text: $t }
+            ]
+          }
+        ]
+      }'
+  else
+    jq -cn --arg t "$text" '$t'
+  fi
+}
+
+select_from_list() {
+  local prompt="$1"
+  shift
+  local -a items=("$@")
+
+  if (( ${#items[@]} == 0 )); then
+    echo ""
+    return 0
+  fi
+
+  echo "$prompt"
+  for ((i=0; i<${#items[@]}; i++)); do
+    printf "%2d) %s\n" "$((i+1))" "${items[$i]}"
+  done
+
+  local choice
+  read -r -p "Choose [1-${#items[@]}] or empty to skip: " choice
+
+  if [[ -z "$choice" ]]; then
+    echo ""
+    return 0
+  fi
+
+  if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#items[@]} )); then
+    echo "Invalid choice." >&2
+    return 1
+  fi
+
+  echo "${items[$((choice-1))]}"
+}
+
+get_issue_link_types() {
+  api GET "${JIRA_API_PREFIX}/issueLinkType" |
+    jq -r '.issueLinkTypes[] | "\(.name)|\(.inward)|\(.outward)"'
+}
+
+select_issue_link_type() {
+  local -a rows labels values
+
+  mapfile -t rows < <(
+    api GET "${JIRA_API_PREFIX}/issueLinkType" |
+    jq -r '
+      .issueLinkTypes[] |
+      "\(.name)|outward|\(.outward)",
+      "\(.name)|inward|\(.inward)"
+    '
+  )
+
+  for row in "${rows[@]}"; do
+    IFS='|' read -r name direction label <<< "$row"
+
+    labels+=("$label")
+    values+=("$name|$direction")
+  done
+
+  echo "Issue link types:" >&2
+
+  for ((i=0; i<${#labels[@]}; i++)); do
+    printf "%2d) %s\n" "$((i+1))" "${labels[$i]}" >&2
+  done
+
+  local choice
+  read -r -p "Choose link type [1-${#labels[@]}]: " choice
+
+  echo "${values[$((choice-1))]}"
+}
+
+select_epic() {
+  local project="$1"
+
+  local jql
+  jql="project = \"$project\" AND issuetype = Epic ORDER BY updated DESC"
+
+  local body
+  body="$(jq -cn --arg jql "$jql" '
+    {
+      jql: $jql,
+      maxResults: 100,
+      fields: ["key","summary"]
+    }')"
+
+  local resp
+  resp="$(api POST "${JIRA_API_PREFIX}/search" "$body")"
+
+  local -a rows labels keys
+  mapfile -t rows < <(echo "$resp" | jq -r '.issues[] | "\(.key)|\(.fields.summary)"')
+
+  if (( ${#rows[@]} == 0 )); then
+    echo ""
+    return 0
+  fi
+
+  for row in "${rows[@]}"; do
+    IFS='|' read -r key summary <<< "$row"
+    labels+=("$key - $summary")
+    keys+=("$key")
+  done
+
+  echo "Epics:" >&2
+  for ((i=0; i<${#labels[@]}; i++)); do
+    printf "%2d) %s\n" "$((i+1))" "${labels[$i]}" >&2
+  done
+
+  local choice
+  read -r -p "Choose epic [1-${#labels[@]}] or empty to skip: " choice
+
+  [[ -z "$choice" ]] && echo "" && return 0
+
+  if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#labels[@]} )); then
+    echo "Invalid choice." >&2
+    return 1
+  fi
+
+  echo "${keys[$((choice-1))]}"
+}
+
+get_epic_field_id() {
+  api GET "${JIRA_API_PREFIX}/field" |
+    jq -r '
+      .[]
+      | select(
+          .name == "Epic Link"
+          or .name == "Parent"
+          or .schema.custom == "com.pyxis.greenhopper.jira:gh-epic-link"
+        )
+      | .id
+    ' | head -n1
+}
+
+cmd_create() {
+  local project=""
+  local issue_type="Task"
+  local summary=""
+  local description=""
+  local priority="Low"
+  local labels=""
+  local assignee=""
+  local link_type=""
+  local link_direction=""
+  local linked_issue=""
+  local epic_key=""
+
+  while (( "$#" )); do
+    case "$1" in
+      --project|-p)      project=${2:-}; shift 2 ;;
+      --type|-t)         issue_type=${2:-}; shift 2 ;;
+      --summary|-s)      summary=${2:-}; shift 2 ;;
+      --description|-d)  description=${2:-}; shift 2 ;;
+      --priority)        priority=${2:-}; shift 2 ;;
+      --labels|-l)       labels=${2:-}; shift 2 ;;
+      --assignee|-a)     assignee=${2:-}; shift 2 ;;
+      --link)            linked_issue=${2:-}; shift 2 ;;
+      --link-type)       link_type=${2:-}; shift 2 ;;
+      --epic)            epic_key=${2:-}; shift 2 ;;
+      -i|--interactive)
+        read -r -p "Project key [DO]: " project
+        read -r -p "Issue type [Task]: " issue_type
+        read -r -p "Summary: " summary
+        read -r -p "Description [empty]: " description
+        read -r -p "Priority [Low]: " priority
+        read -r -p "Labels comma-separated [empty]: " labels
+        read -r -p "Assignee [empty=automatic]: " assignee
+        read -r -p "Linked issue [empty=none]: " linked_issue
+        if [[ -n "$linked_issue" ]]; then
+          selected="$(select_issue_link_type)"
+
+          IFS='|' read -r link_type link_direction <<< "$selected"
+        fi
+
+        epic_key="$(select_epic "${project:-DO}")"
+        shift
+        ;;
+      *) echo "Unknown option: $1"; exit 1 ;;
+    esac
+  done
+
+  project="${project:-DO}"
+  issue_type="${issue_type:-Task}"
+  priority="${priority:-Low}"
+  if [[ -n "$linked_issue" && -z "$link_type" ]]; then
+    echo "Linked issue was provided but no link type selected."
+    exit 1
+  fi
+
+  [[ -z "$summary" ]] && read -r -p "Summary: " summary
+  [[ -z "$summary" ]] && { echo "Summary is required."; exit 1; }
+
+  local desc_json
+  desc_json="$(jira_text_field_json "$description")"
+
+  local payload
+  payload="$(jq -cn \
+    --arg project "$project" \
+    --arg issue_type "$issue_type" \
+    --arg summary "$summary" \
+    --arg priority "$priority" \
+    --argjson description "$desc_json" \
+    --arg labels "$labels" \
+    --arg assignee "$assignee" \
+    --arg epic_key "$epic_key" \
+    --arg epic_field "${JIRA_EPIC_LINK_FIELD:-$(get_epic_field_id)}" '
+    {
+      fields: {
+        project: { key: $project },
+        issuetype: { name: $issue_type },
+        summary: $summary,
+        description: $description,
+        priority: { name: $priority }
+      }
+    }
+    | if ($labels | length) > 0 then
+        .fields.labels = ($labels | split(",") | map(gsub("^\\s+|\\s+$"; "")))
+      else . end
+    | if ($assignee | length) > 0 then
+        .fields.assignee = { name: $assignee }
+      else . end
+    | if ($epic_key | length) > 0 and ($epic_field | length) > 0 then
+        .fields[$epic_field] = $epic_key
+      else . end
+  ')"
+
+  local out
+  out="$(api POST "${JIRA_API_PREFIX}/issue" "$payload")" || true
+
+  if ! echo "$out" | jq -e '.key' >/dev/null 2>&1; then
+    echo "Create issue response:"
+    echo "$out" | jq . 2>/dev/null || echo "$out"
+    return 1
+  fi
+
+  local new_key
+  new_key="$(echo "$out" | jq -r '.key')"
+
+  echo "Issue created: $new_key"
+
+  if [[ -n "$linked_issue" ]]; then
+    local link_payload
+    if [[ "$link_direction" == "outward" ]]; then
+
+      link_payload="$(jq -cn \
+        --arg type "$link_type" \
+        --arg new "$new_key" \
+        --arg existing "$linked_issue" '
+        {
+          type: { name: $type },
+          outwardIssue: { key: $new },
+          inwardIssue: { key: $existing }
+        }')"
+
+    else
+
+      link_payload="$(jq -cn \
+        --arg type "$link_type" \
+        --arg new "$new_key" \
+        --arg existing "$linked_issue" '
+        {
+          type: { name: $type },
+          outwardIssue: { key: $existing },
+          inwardIssue: { key: $new }
+        }')"
+
+    fi
+
+    local link_out
+    link_out="$(api POST "${JIRA_API_PREFIX}/issueLink" "$link_payload")" || true
+
+    if [[ -z "$link_out" ]]; then
+      echo "Linked $new_key to $linked_issue."
+    else
+      echo "Link response:"
+      echo "$link_out" | jq . 2>/dev/null || echo "$link_out"
+    fi
+  fi
+}
+
 usage() {
   cat <<'EOF'
 jira-cli.sh — Tiny Jira CLI
@@ -297,6 +594,9 @@ Commands:
   comment|c ISSUE_KEY --message|-m "..."
   comments|cs ISSUE_KEY
   delete-comment|dc ISSUE_KEY COMMENT_ID
+
+  create|new -i
+  create|new --project DO --type Task --summary "..." --description "..." --priority Low
 
 Examples:
   j c K45-123 -m "Fixed this issue."
@@ -322,6 +622,7 @@ main() {
     comment|c)           cmd_comment "$@" ;;
     comments|cs)         cmd_comments "$@" ;;
     delete-comment|dc)   cmd_delete_comment "$@" ;;
+    create|new)          cmd_create "$@" ;;
     ""|help|-h|--help)   usage ;;
     *) echo "Unknown command: $cmd"; usage; exit 1 ;;
   esac
