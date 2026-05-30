@@ -9,9 +9,7 @@ CONFIG_CANDIDATES=(
 
 load_config() {
   for f in "${CONFIG_CANDIDATES[@]}"; do
-    if [[ -f "$f" ]]; then
-      source "$f"
-    fi
+    [[ -f "$f" ]] && source "$f"
   done
 }
 
@@ -21,7 +19,7 @@ require_deps() {
 }
 
 check_env() {
-  : "${JIRA_URL:?Set JIRA_URL (e.g., https://your-jira-instance)}"
+  : "${JIRA_URL:?Set JIRA_URL}"
   JIRA_API_PREFIX="${JIRA_API_PREFIX:-/rest/api/2}"
 
   if [[ -n "${JIRA_TOKEN:-}" ]]; then
@@ -29,7 +27,7 @@ check_env() {
   elif [[ -n "${JIRA_USER:-}" && -n "${JIRA_PASS:-}" ]]; then
     AUTH_MODE="basic"
   else
-    echo "Set JIRA_TOKEN (Bearer) OR JIRA_USER and JIRA_PASS (Basic auth)." >&2
+    echo "Set JIRA_TOKEN OR JIRA_USER and JIRA_PASS." >&2
     exit 1
   fi
 }
@@ -43,8 +41,33 @@ auth_args() {
 }
 
 curl_base_args() {
-  if [[ -n "${JIRA_CURL_OPTS:-}" ]]; then
-    echo $JIRA_CURL_OPTS
+  [[ -n "${JIRA_CURL_OPTS:-}" ]] && echo $JIRA_CURL_OPTS
+}
+
+jira_comment_json() {
+  local comment="$1"
+
+  if [[ "$JIRA_API_PREFIX" == *"/3" ]]; then
+    jq -cn --arg c "$comment" '
+      {
+        body: {
+          type: "doc",
+          version: 1,
+          content: [
+            {
+              type: "paragraph",
+              content: [
+                {
+                  type: "text",
+                  text: $c
+                }
+              ]
+            }
+          ]
+        }
+      }'
+  else
+    jq -cn --arg c "$comment" '{body: $c}'
   fi
 }
 
@@ -54,25 +77,16 @@ api() {
   local data=${1:-}
   local url="${JIRA_URL%/}${path}"
 
-  local -a args
   local -a auth=( $(auth_args) )
   local -a extra=( $(curl_base_args) )
+  local -a args=(-sS "${extra[@]}" -X "$method" "${auth[@]}" -H "Content-Type: application/json")
 
-  args=(-sS "${extra[@]}" -X "$method" "${auth[@]}" -H "Content-Type: application/json")
+  [[ -n "${JIRA_DEBUG:-}" ]] && echo "[DEBUG] $method $url" >&2
 
-  if [[ -n "${JIRA_DEBUG:-}" ]]; then
-    echo "[DEBUG] $method $url" >&2
-    if [[ -n "$data" ]]; then echo "[DEBUG] payload: $data" >&2; fi
-  fi
-
-  if [[ "$method" == "GET" ]]; then
+  if [[ "$method" == "GET" || "$method" == "DELETE" ]]; then
     curl "${args[@]}" "$url"
   else
-    if [[ -n "$data" ]]; then
-      curl "${args[@]}" --data "$data" "$url"
-    else
-      curl "${args[@]}" "$url"
-    fi
+    curl "${args[@]}" --data "$data" "$url"
   fi
 }
 
@@ -115,10 +129,7 @@ cmd_transitions() {
 
   local count
   count="$(echo "$resp" | jq '.transitions | length')"
-  if [[ "$count" -eq 0 ]]; then
-    echo "No transitions available for $key."
-    return 0
-  fi
+  [[ "$count" -eq 0 ]] && { echo "No transitions available for $key."; return 0; }
 
   echo "Available transitions for $key:"
   echo "$resp" | jq -r '
@@ -136,10 +147,7 @@ cmd_transition() {
 
   local total
   total="$(echo "$resp" | jq '.transitions | length')"
-  if [[ "$total" -eq 0 ]]; then
-    echo "No transitions available for $key."
-    return 1
-  fi
+  [[ "$total" -eq 0 ]] && { echo "No transitions available for $key."; return 1; }
 
   mapfile -t IDS   < <(echo "$resp" | jq -r '.transitions[].id')
   mapfile -t LABEL < <(echo "$resp" | jq -r '.transitions[] | "\(.name) → \(.to.name)"')
@@ -165,11 +173,7 @@ cmd_transition() {
   local out
   out="$(api POST "${JIRA_API_PREFIX}/issue/${key}/transitions" "$payload")" || true
 
-  if [[ -z "$out" ]]; then
-    echo "Transition applied."
-  else
-    echo "$out" | jq . 2>/dev/null || echo "$out"
-  fi
+  [[ -z "$out" ]] && echo "Transition applied." || echo "$out" | jq . 2>/dev/null || echo "$out"
 }
 
 cmd_worklog() {
@@ -189,15 +193,9 @@ cmd_worklog() {
     esac
   done
 
-  if [[ -z "$time_spent" ]]; then
-    read -r -p "Time spent (e.g., 1h 30m): " time_spent
-  fi
-  if [[ -z "$comment" ]]; then
-    read -r -p "Comment: " comment
-  fi
-  if [[ -z "$started" ]]; then
-    started="$(date -u +"%Y-%m-%dT%H:%M:%S.000+0000")"
-  fi
+  [[ -z "$time_spent" ]] && read -r -p "Time spent: " time_spent
+  [[ -z "$comment" ]] && read -r -p "Comment: " comment
+  [[ -z "$started" ]] && started="$(date -u +"%Y-%m-%dT%H:%M:%S.000+0000")"
 
   local payload
   payload="$(jq -cn --arg c "$comment" --arg t "$time_spent" --arg s "$started" '
@@ -207,33 +205,84 @@ cmd_worklog() {
   out="$(api POST "${JIRA_API_PREFIX}/issue/${key}/worklog" "$payload")" || true
 
   if echo "$out" | jq -e '.id' >/dev/null 2>&1; then
-    local wid
-    wid="$(echo "$out" | jq -r '.id')"
-    echo "Worklog added (id: $wid) to $key."
+    echo "Worklog added (id: $(echo "$out" | jq -r '.id')) to $key."
   else
-    echo "Worklog response:"
     echo "$out" | jq . 2>/dev/null || echo "$out"
   fi
+}
+
+cmd_comment() {
+  local key=${1:?Usage: comment ISSUE_KEY --message|-m \"...\"}
+  shift
+
+  local message=""
+
+  while (( "$#" )); do
+    case "$1" in
+      --message|-m|--body|-b) message=${2:-}; shift 2 ;;
+      *) echo "Unknown option: $1"; exit 1 ;;
+    esac
+  done
+
+  [[ -z "$message" ]] && read -r -p "Comment: " message
+
+  local payload
+  payload="$(jira_comment_json "$message")"
+
+  local out
+  out="$(api POST "${JIRA_API_PREFIX}/issue/${key}/comment" "$payload")" || true
+
+  if echo "$out" | jq -e '.id' >/dev/null 2>&1; then
+    echo "Comment added (id: $(echo "$out" | jq -r '.id')) to $key."
+  else
+    echo "$out" | jq . 2>/dev/null || echo "$out"
+  fi
+}
+
+cmd_comments() {
+  local key=${1:?Usage: comments ISSUE_KEY}
+
+  api GET "${JIRA_API_PREFIX}/issue/${key}/comment" | jq -r '
+    .comments[] |
+    "id: \(.id)\nauthor: \(.author.displayName // .author.name // "-")\ncreated: \(.created)\ncomment:\n\(
+      if (.body | type) == "string" then
+        .body
+      else
+        [.body.content[]?.content[]?.text?] | join("\n")
+      end
+    )\n---"'
+}
+
+cmd_delete_comment() {
+  local key=${1:?Usage: delete-comment ISSUE_KEY COMMENT_ID}
+  local comment_id=${2:?Usage: delete-comment ISSUE_KEY COMMENT_ID}
+
+  local out
+  out="$(api DELETE "${JIRA_API_PREFIX}/issue/${key}/comment/${comment_id}")" || true
+
+  [[ -z "$out" ]] && echo "Comment $comment_id deleted from $key." || echo "$out" | jq . 2>/dev/null || echo "$out"
 }
 
 usage() {
   cat <<'EOF'
 jira-cli.sh — Tiny Jira CLI
 
-Required env/config:
-  JIRA_URL
-  JIRA_API_PREFIX   (default: /rest/api/2, set /rest/api/3 for Jira Cloud)
-  JIRA_TOKEN        OR JIRA_USER + JIRA_PASS
-Optional:
-  JIRA_CURL_OPTS
-  JIRA_DEBUG=1
-
 Commands:
   whoami
-  list [JQL]
+  list|l [JQL]
   transitions ISSUE_KEY
   transition|t ISSUE_KEY [N]
-  worklog|w ISSUE_KEY --time|-t "1h" --comment|-c "..." [--started|-s "YYYY-MM-DDThh:mm:ss.000+0000"]
+
+  worklog|w ISSUE_KEY --time|-t "1h" --comment|-c "..." [--started|-s "..."]
+
+  comment|c ISSUE_KEY --message|-m "..."
+  comments|cs ISSUE_KEY
+  delete-comment|dc ISSUE_KEY COMMENT_ID
+
+Examples:
+  j c K45-123 -m "Fixed this issue."
+  j comments K45-123
+  j dc K45-123 10042
 EOF
 }
 
@@ -242,15 +291,20 @@ main() {
   require_deps
   check_env
 
-  local cmd="${1:-}"; shift || true
+  local cmd="${1:-}"
+  shift || true
+
   case "${cmd:-}" in
-    whoami)        cmd_whoami "$@";;
-    list|l)        cmd_list "$@";;
-    transitions)   cmd_transitions "$@";;
-    transition|t)  cmd_transition "$@";;
-    worklog|w)     cmd_worklog "$@";;
-    ""|help|-h|--help) usage;;
-    *) echo "Unknown command: $cmd"; usage; exit 1;;
+    whoami)              cmd_whoami "$@" ;;
+    list|l)              cmd_list "$@" ;;
+    transitions)         cmd_transitions "$@" ;;
+    transition|t)        cmd_transition "$@" ;;
+    worklog|w)           cmd_worklog "$@" ;;
+    comment|c)           cmd_comment "$@" ;;
+    comments|cs)         cmd_comments "$@" ;;
+    delete-comment|dc)   cmd_delete_comment "$@" ;;
+    ""|help|-h|--help)   usage ;;
+    *) echo "Unknown command: $cmd"; usage; exit 1 ;;
   esac
 }
 
