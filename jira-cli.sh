@@ -114,12 +114,18 @@ cmd_list() {
       .key,
       .fields.issuetype.name,
       .fields.status.name,
-      (.fields.updated | sub("\\..*$";"") | gsub("T";" ")),
+      .fields.updated,
       (.fields.summary | gsub("[\\r\\n]"; " "))
     ] | @tsv' |
   while IFS=$'\t' read -r k it s u m; do
-    printf "%-14s %-14s %-18s %-20s %s\n" "$k" "$it" "$s" "$u" "$m"
+    u="$(fmt_local_time "$u")"
+    printf "%-14s %-14s %-18s %-24s %s\n" "$k" "$it" "$s" "$u" "$m"
   done
+}
+
+fmt_local_time() {
+  local ts="$1"
+  date -d "$ts" +"%Y-%m-%d %H:%M:%S %Z"
 }
 
 cmd_transitions() {
@@ -195,7 +201,7 @@ cmd_worklog() {
 
   [[ -z "$time_spent" ]] && read -r -p "Time spent: " time_spent
   [[ -z "$comment" ]] && read -r -p "Comment: " comment
-  [[ -z "$started" ]] && started="$(date -u +"%Y-%m-%dT%H:%M:%S.000+0000")"
+  [[ -z "$started" ]] && started="$(date +"%Y-%m-%dT%H:%M:%S.000%z")"
 
   local payload
   payload="$(jq -cn --arg c "$comment" --arg t "$time_spent" --arg s "$started" '
@@ -244,13 +250,26 @@ cmd_comments() {
 
   api GET "${JIRA_API_PREFIX}/issue/${key}/comment" | jq -r '
     .comments[] |
-    "id: \(.id)\nauthor: \(.author.displayName // .author.name // "-")\ncreated: \(.created)\ncomment:\n\(
-      if (.body | type) == "string" then
-        .body
-      else
-        [.body.content[]?.content[]?.text?] | join("\n")
-      end
-    )\n---"'
+    [
+      .id,
+      (.author.displayName // .author.name // "-"),
+      .created,
+      (
+        if (.body | type) == "string" then
+          .body
+        else
+          [.body.content[]?.content[]?.text?] | join("\n")
+        end
+      )
+    ] | @tsv' |
+  while IFS=$'\t' read -r id author created body; do
+    echo "id: $id"
+    echo "author: $author"
+    echo "created: $(fmt_local_time "$created")"
+    echo "comment:"
+    echo "$body"
+    echo "---"
+  done
 }
 
 cmd_delete_comment() {
